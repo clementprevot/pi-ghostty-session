@@ -1,0 +1,48 @@
+{
+	"name": "@clementprevot/pi-ghostty-session",
+	"version": "0.1.0",
+	"description": "Pi extension that opens a new pi session in a Ghostty split, tab, or window on macOS, started in the folder and with the prompt you choose",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"ghostty",
+		"terminal",
+		"session",
+		"split",
+		"applescript"
+	],
+	"license": "MIT",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/clementprevot/pi-ghostty-session.git"
+	},
+	"engines": {
+		"node": ">=22.6"
+	},
+	"files": [
+		"index.ts"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@types/node": "^24.0.0",
+		"typebox": "*",
+		"typescript": "^5.9.0"
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
