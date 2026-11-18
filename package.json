@@ -1,6 +1,6 @@
 {
 	"name": "@clementprevot/pi-ghostty-session",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi extension that opens a new pi session in a Ghostty split, tab, or window on macOS, started in the folder and with the prompt you choose",
 	"keywords": [
 		"pi-package",
