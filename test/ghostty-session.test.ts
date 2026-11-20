@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,15 +8,21 @@ import type { ExecResult } from "@earendil-works/pi-coding-agent";
 import {
 	type BatchRequest,
 	buildPiCommand,
+	findLiveSession,
 	GHOSTTY_BATCH_SCRIPT,
+	GHOSTTY_FIND_SCRIPT,
 	GHOSTTY_SCRIPT,
 	isGhosttyOnMac,
 	openSession,
 	openSessions,
 	parseCommandArgs,
+	registerLiveSession,
 	resolveDirectory,
+	resolveSession,
 	type SessionRequest,
+	type StoredSession,
 	shellQuote,
+	unregisterLiveSession,
 	writePromptFile,
 } from "../index.ts";
 
@@ -24,13 +30,13 @@ const GHOSTTY = { env: { TERM_PROGRAM: "ghostty" }, platform: "darwin" };
 
 type Call = { command: string; args: string[] };
 
-function fakeExec(osascript: Partial<ExecResult> = {}, psTty = "ttys007") {
+function fakeExec(osascript: Partial<ExecResult> = {}, psTty = "ttys007", psCommand = "pi") {
 	const calls: Call[] = [];
 	const exec = async (command: string, args: string[]): Promise<ExecResult> => {
 		calls.push({ command, args });
 		const base = { stdout: "", stderr: "", code: 0, killed: false, truncated: false };
 		if (command === "ps") {
-			return { ...base, stdout: `${psTty}\n` };
+			return { ...base, stdout: args.includes("tty=,command=") ? `${psTty} ${psCommand}\n` : `${psTty}\n` };
 		}
 
 		return { ...base, stdout: "own\ttab-1\tterm-1\n", ...osascript };
@@ -212,8 +218,93 @@ test("openSessions refuses a bad request before calling Ghostty", async () => {
 });
 
 test("the AppleScript sources compile", { skip: process.platform !== "darwin" }, () => {
-	for (const script of [GHOSTTY_SCRIPT, GHOSTTY_BATCH_SCRIPT]) {
+	for (const script of [GHOSTTY_SCRIPT, GHOSTTY_BATCH_SCRIPT, GHOSTTY_FIND_SCRIPT]) {
 		const output = join(mkdtempSync(join(tmpdir(), "pi-ghostty-session-scpt-")), "script.scpt");
 		execFileSync("osacompile", ["-o", output, "-e", script]);
 	}
+});
+
+function storedSession(id: string, name?: string): StoredSession {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-ghostty-session-project-"));
+	const path = join(mkdtempSync(join(tmpdir(), "pi-ghostty-session-sessions-")), `2026_${id}.jsonl`);
+	writeFileSync(path, `${JSON.stringify({ type: "session", version: 3, id, cwd })}\n{"type":"message"}\n`);
+
+	return { id, path, cwd, name };
+}
+
+function resumeOptions(sessions: StoredSession[], liveDir = mkdtempSync(join(tmpdir(), "pi-ghostty-session-live-"))) {
+	return { ...GHOSTTY, promptDir: mkdtempSync(join(tmpdir(), "pi-ghostty-session-test-")), liveDir, listSessions: async () => sessions };
+}
+
+test("resolveSession reads a session file, or finds an id by exact match or unique prefix", async () => {
+	const alpha = storedSession("01aa-alpha", "alpha");
+	const beta = storedSession("01ab-beta");
+	const list = async () => [alpha, beta];
+	assert.deepEqual(await resolveSession(alpha.path, "/", list), { id: alpha.id, cwd: alpha.cwd, path: alpha.path });
+	assert.equal((await resolveSession("01ab-beta", "/", list)).path, beta.path);
+	assert.equal((await resolveSession("01aa", "/", list)).id, alpha.id);
+	await assert.rejects(resolveSession("01a", "/", list), /matches 2 sessions \("alpha" \(01aa-alpha\) in .*; 01ab-beta in .*\)/);
+	await assert.rejects(resolveSession("zz", "/", list), /No pi session matches "zz"/);
+	const notSession = join(mkdtempSync(join(tmpdir(), "pi-ghostty-session-")), "notes.jsonl");
+	writeFileSync(notSession, '{"type":"message"}\n');
+	await assert.rejects(resolveSession(notSession, "/", list), /is not a pi session file/);
+});
+
+test("the live registry only trusts a pi process still on the recorded terminal", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-ghostty-session-live-"));
+	registerLiveSession(dir, "s-1", { pid: 4242, tty: "/dev/ttys007" });
+	assert.deepEqual(await findLiveSession(fakeExec().exec, dir, "s-1"), { pid: 4242, tty: "/dev/ttys007" });
+	assert.equal(await findLiveSession(fakeExec({}, "ttys008").exec, dir, "s-1"), undefined);
+	assert.equal(await findLiveSession(fakeExec({}, "ttys007", "zsh").exec, dir, "s-1"), undefined);
+	assert.equal(await findLiveSession(fakeExec().exec, dir, "s-2"), undefined);
+	unregisterLiveSession(dir, "s-1", 1);
+	assert.ok(existsSync(join(dir, "s-1.json")), "another process must not remove the entry");
+	unregisterLiveSession(dir, "s-1", 4242);
+	assert.equal(existsSync(join(dir, "s-1.json")), false);
+});
+
+test("openSession resumes a stored session from its own folder", async () => {
+	const session = storedSession("01aa-alpha", "alpha");
+	const { exec, calls } = fakeExec();
+	const text = await openSession(exec, { surface: "tab", session: "01aa", prompt: "carry on" }, tmpdir(), resumeOptions([session]));
+	const args = scriptArgs(calls);
+	assert.equal(args.directory, session.cwd);
+	assert.match(args.input!, new RegExp(`^pi --session '${session.path}' "\\$\\(command cat '[^']+'\\)"\\n$`));
+	assert.match(text, /^Resumed pi session "alpha" \(01aa-alpha\) in a new tab .* with the prompt as its next message/);
+});
+
+test("openSession focuses a session that already runs instead of opening it twice", async () => {
+	const session = storedSession("01aa-alpha", "alpha");
+	const options = resumeOptions([session]);
+	registerLiveSession(options.liveDir, session.id, { pid: 4242, tty: "/dev/ttys007" });
+	const { exec, calls } = fakeExec({ stdout: "tab-5\tReviews\n" });
+	const text = await openSession(exec, { surface: "tab", session: session.id }, tmpdir(), options);
+	const scripts = calls.filter((call) => call.command === "osascript");
+	assert.equal(scripts.length, 1);
+	assert.deepEqual(scripts[0]!.args.slice(1), [GHOSTTY_FIND_SCRIPT, "/dev/ttys007", "focus"]);
+	assert.match(text, /already open, so no new pane opened\. Its pane, in the Ghostty tab "Reviews" \(tab id tab-5\), now has the focus/);
+	const outside = await openSession(fakeExec({ stdout: "" }).exec, { surface: "tab", session: session.id }, tmpdir(), options);
+	assert.match(outside, /pi process 4242 on \/dev\/ttys007, outside the Ghostty terminals/);
+});
+
+test("openSessions refuses a running or repeated session before opening anything", async () => {
+	const alpha = storedSession("01aa-alpha", "alpha");
+	const beta = storedSession("01ab-beta");
+	const options = resumeOptions([alpha, beta]);
+	const repeated = fakeExec();
+	await assert.rejects(
+		openSessions(repeated.exec, { tabs: [{ sessions: [{ session: alpha.id }, { session: alpha.path }] }] }, tmpdir(), options),
+		/appears twice/,
+	);
+	registerLiveSession(options.liveDir, beta.id, { pid: 4242, tty: "/dev/ttys007" });
+	const { exec, calls } = fakeExec({ stdout: "tab-5\tReviews\n" });
+	await assert.rejects(
+		openSessions(exec, { tabs: [{ sessions: [{ session: alpha.id }, { session: "01ab" }] }] }, tmpdir(), options),
+		/Nothing opened\. .* Session 01ab-beta is already open in the Ghostty tab "Reviews"/,
+	);
+	assert.deepEqual(
+		calls.filter((call) => call.command === "osascript").map((call) => call.args.slice(2)),
+		[["/dev/ttys007", "locate"]],
+	);
+	assert.equal(repeated.calls.filter((call) => call.command === "osascript").length, 0);
 });

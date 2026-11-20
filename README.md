@@ -29,8 +29,9 @@ The agent calls the `open_session` tool:
 ```
 
 - `surface`: `split-right`, `split-down`, `split-left`, `split-up` (a split of the pane that runs the current session), `tab` (a new tab in its window), or `window`.
-- `cwd` (optional): folder to start in, absolute, relative to the working directory, or starting with `~/`. Defaults to the working directory.
-- `prompt` (optional): the first message of the new session. Without it, pi opens idle.
+- `session` (optional): an existing session to resume instead of starting a new one, as a session file path or a full or partial session id. See "Resume a session" below.
+- `cwd` (optional): folder to start in, absolute, relative to the working directory, or starting with `~/`. Defaults to the folder of the resumed session, or else the working directory.
+- `prompt` (optional): the first message of the new session, or the next message of a resumed one. Without it, pi opens idle.
 - `model` (optional): passed to `pi --model`, so `provider/id` and a `:<thinking>` suffix work.
 - `name` (optional): the session display name, passed to `pi --name`.
 
@@ -65,18 +66,36 @@ The agent calls the `open_sessions` tool with one entry per tab:
 - `tabs`: each entry opens a new tab and gives every session its own pane in it.
 - `title` (optional): the tab title, usually the topic. It also renames an existing tab.
 - `tab` (optional): the id of a tab opened earlier by `open_session` or `open_sessions`. The sessions join that tab instead of a new one.
-- `sessions`: the sessions of the tab, with the same `cwd`, `prompt`, `model` and `name` fields as `open_session`.
+- `sessions`: the sessions of the tab, with the same `session`, `cwd`, `prompt`, `model` and `name` fields as `open_session`.
 - `placement` (optional, top level): `tab` puts the new tabs in the window of the current session, which is the default. `window` puts them in a new window.
 
 The panes of a tab sit in two columns, filled row by row: the second pane goes right of the first, the third under the first, and so on. Ghostty then evens out their sizes. The result lists each tab id and each session's terminal id.
 
 To have your agent use them, add lines like these to your instructions: "When I ask for a new session I can join, open it with `open_session`. When I ask for several related sessions at once, open them with `open_sessions`: one tab per topic, one pane per session."
 
+### Resume a session
+
+Set `session` to reopen a session you closed, for example one an agent found for you:
+
+```json
+{ "surface": "tab", "session": "01a1f8ad" }
+```
+
+The tool finds the session file, then types `pi --session <file>` into a new pane started in the session's own folder. It always passes the file, never the id: given an id from another project, pi would offer to fork the session into the current folder.
+
+A session can run in one pane only, so the tool first checks whether it already runs:
+
+- `open_session` opens nothing and moves the focus to the pane that runs it, then says which tab holds that pane
+- `open_sessions` opens nothing at all and lists the sessions to remove from the request, with their tabs
+- when the session runs in a terminal Ghostty does not show (inside tmux, for example), the result gives its process id and TTY instead
+
+To know which sessions run, each pi session that loads this extension records its id, process id and TTY in `pi-ghostty-session/live/` under the system temp directory, and removes the entry when it ends. Sessions started before you installed this version are not recorded until you restart them or run `/reload`.
+
 ## How it works
 
 1. The tool resolves each folder and checks that it exists, before it asks Ghostty for anything.
 2. If there is a prompt, it writes it to a private file (mode 600) in `pi-ghostty-session/` under the system temp directory.
-3. It runs one AppleScript through `osascript`, even for a batch. The script asks Ghostty for each new surface and types `pi [--model ...] [--name ...] "$(command cat <prompt file>)"` into it. Every value reaches the script as an argument, never as script source.
+3. It runs one AppleScript through `osascript`, even for a batch. The script asks Ghostty for each new surface and types `pi [--session ...] [--model ...] [--name ...] "$(command cat <prompt file>)"` into it. Every value reaches the script as an argument, never as script source.
 4. For a split or a new tab, the script finds the terminal of the current session by its TTY. The new surface lands next to this session even when another pane has the focus. If the script cannot find that terminal (inside tmux, for example), it uses the front window and says so. With no Ghostty window open, it opens a new window.
 
 The command runs in a fresh shell, so your PATH and shell setup apply, and the shell stays open when you quit pi.
@@ -89,7 +108,7 @@ The command runs in a fresh shell, so your PATH and shell setup apply, and the s
 
 ## Privacy and data
 
-The extension writes the prompts you send to the temp directory and talks to Ghostty through AppleScript. It makes no network calls and collects no data.
+The extension writes the prompts you send, and one small entry per running session (its id, process id and TTY), to the temp directory. It talks to Ghostty through AppleScript, makes no network calls and collects no data.
 
 ## Local development
 

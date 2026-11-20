@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export const SURFACES = ["split-right", "split-down", "split-left", "split-up", "tab", "window"] as const;
@@ -12,6 +12,7 @@ export const PLACEMENTS = ["tab", "window"] as const;
 export type Placement = (typeof PLACEMENTS)[number];
 
 export type SessionSpec = {
+	session?: string;
 	cwd?: string;
 	prompt?: string;
 	model?: string;
@@ -34,13 +35,25 @@ export type BatchRequest = {
 export type OpenedTab = {
 	id: string;
 	title?: string;
-	sessions: { name?: string; directory: string; terminal: string }[];
+	sessions: { name?: string; directory: string; terminal: string; resumed?: string }[];
 };
 
 type Exec = Pick<ExtensionAPI, "exec">["exec"];
 type Env = Record<string, string | undefined>;
-type ScriptOptions = { env?: Env; platform?: string; signal?: AbortSignal; promptDir?: string };
-type PreparedSession = { directory: string; input: string; hasPrompt: boolean; name?: string };
+export type StoredSession = { id: string; path: string; cwd: string; name?: string };
+export type LiveSession = { pid: number; tty: string };
+
+type ScriptOptions = {
+	env?: Env;
+	platform?: string;
+	signal?: AbortSignal;
+	promptDir?: string;
+	liveDir?: string;
+	listSessions?: () => Promise<StoredSession[]>;
+};
+type PreparedSession = { directory: string; input: string; hasPrompt: boolean; name?: string; resumed?: StoredSession };
+
+export const LIVE_DIR = join(tmpdir(), "pi-ghostty-session", "live");
 
 const SURFACE_LABELS: Record<Surface, string> = {
 	"split-right": "a split to the right of this session",
@@ -51,16 +64,16 @@ const SURFACE_LABELS: Record<Surface, string> = {
 	window: "a new window",
 };
 
-const SCRIPT_HANDLERS = `on findOwn(ownTty)
+const SCRIPT_HANDLERS = `on findByTty(ttyPath)
 	tell application "Ghostty"
 		repeat with w in windows
 			repeat with t in terminals of w
-				if tty of t is ownTty then return {contents of w, contents of t}
+				if tty of t is ttyPath then return {contents of w, contents of t}
 			end repeat
 		end repeat
 	end tell
 	return missing value
-end findOwn
+end findByTty
 
 on findTab(tabId)
 	tell application "Ghostty"
@@ -73,18 +86,18 @@ on findTab(tabId)
 	error "No Ghostty tab has the id " & tabId & "."
 end findTab
 
-on tabIdOf(terminalId)
+on tabOf(terminalId)
 	tell application "Ghostty"
 		repeat with w in windows
 			repeat with t in tabs of w
 				repeat with s in terminals of t
-					if id of s is terminalId then return id of t
+					if id of s is terminalId then return contents of t
 				end repeat
 			end repeat
 		end repeat
 	end tell
-	return ""
-end tabIdOf
+	return missing value
+end tabOf
 
 -- Ghostty lists the terminals of a tab column by column, so the panes stay in two columns filled row by row: the second
 -- pane goes right of the first, and each later one goes under the bottom pane of the shorter column.
@@ -114,7 +127,7 @@ on run argv
 			return "window" & sep & (id of newTab) & sep & (id of (focused terminal of newTab))
 		end if
 		set located to "own"
-		set ownPair to my findOwn(ownTty)
+		set ownPair to my findByTty(ownTty)
 		if ownPair is missing value then
 			set located to "front"
 			set targetWindow to front window
@@ -136,7 +149,7 @@ on run argv
 		else
 			error "Unknown surface: " & surfaceKind
 		end if
-		return located & sep & (my tabIdOf(id of newTerminal)) & sep & (id of newTerminal)
+		return located & sep & (id of (my tabOf(id of newTerminal))) & sep & (id of newTerminal)
 	end tell
 end run`;
 
@@ -151,7 +164,7 @@ on run argv
 		set targetWindow to missing value
 		set located to "window"
 		if placement is "tab" then
-			set ownPair to my findOwn(ownTty)
+			set ownPair to my findByTty(ownTty)
 			if ownPair is not missing value then
 				set targetWindow to item 1 of ownPair
 				set located to "own"
@@ -195,6 +208,20 @@ on run argv
 	end tell
 end run`;
 
+export const GHOSTTY_FIND_SCRIPT = `${SCRIPT_HANDLERS}
+on run argv
+	set sep to character id 9
+	set {targetTty, mode} to argv
+	tell application "Ghostty"
+		set hit to my findByTty(targetTty)
+		if hit is missing value then return ""
+		set targetTerminal to item 2 of hit
+		if mode is "focus" then focus targetTerminal
+		set targetTab to my tabOf(id of targetTerminal)
+		return (id of targetTab) & sep & (name of targetTab)
+	end tell
+end run`;
+
 export function isSurface(value: string): value is Surface {
 	return (SURFACES as readonly string[]).includes(value);
 }
@@ -203,8 +230,11 @@ export function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-export function buildPiCommand(options: { promptFile?: string; model?: string; name?: string }): string {
+export function buildPiCommand(options: { session?: string; promptFile?: string; model?: string; name?: string }): string {
 	const parts = ["pi"];
+	if (options.session) {
+		parts.push("--session", shellQuote(options.session));
+	}
 	if (options.model) {
 		parts.push("--model", shellQuote(options.model));
 	}
@@ -271,16 +301,113 @@ function assertGhostty(tool: string, options: ScriptOptions): void {
 	}
 }
 
-function prepareSession(spec: SessionSpec, cwd: string, promptDir?: string): PreparedSession {
-	const directory = resolveDirectory(spec.cwd, cwd);
+export function readSessionHeader(path: string): { id: string; cwd: string } {
+	let header: { type?: unknown; id?: unknown; cwd?: unknown } | undefined;
+	try {
+		const fd = openSync(path, "r");
+		const buffer = Buffer.alloc(64 * 1024);
+		const length = readSync(fd, buffer, 0, buffer.length, 0);
+		closeSync(fd);
+		header = JSON.parse(buffer.subarray(0, length).toString("utf8").split("\n")[0] ?? "");
+	} catch {
+		header = undefined;
+	}
+	if (header?.type !== "session" || typeof header.id !== "string") {
+		throw new Error(`${path} is not a pi session file.`);
+	}
+
+	return { id: header.id, cwd: typeof header.cwd === "string" ? header.cwd : "" };
+}
+
+/** Resolves a session file path, or a full or partial session id, to the stored session it names. */
+export async function resolveSession(ref: string, cwd: string, listSessions: () => Promise<StoredSession[]>): Promise<StoredSession> {
+	const value = ref.trim();
+	if (value.includes("/") || value.endsWith(".jsonl")) {
+		const path = resolveDirectory(value, cwd);
+
+		return { ...readSessionHeader(path), path };
+	}
+	const sessions = await listSessions();
+	const exact = sessions.find((session) => session.id === value);
+	const matches = exact ? [exact] : sessions.filter((session) => session.id.startsWith(value));
+	if (matches.length === 0) {
+		throw new Error(`No pi session matches "${value}".`);
+	}
+	if (matches.length > 1) {
+		const listed = matches.slice(0, 5).map((session) => `${sessionLabel(session)} in ${session.cwd}`);
+		throw new Error(`"${value}" matches ${matches.length} sessions (${listed.join("; ")}). Pass a longer id or the session file.`);
+	}
+
+	return matches[0]!;
+}
+
+function sessionLabel(session: { id: string; name?: string }): string {
+	return session.name ? `"${session.name}" (${session.id})` : session.id;
+}
+
+function liveFile(dir: string, id: string): string | undefined {
+	return /^[\w-]+$/.test(id) ? join(dir, `${id}.json`) : undefined;
+}
+
+export function registerLiveSession(dir: string, id: string, live: LiveSession): void {
+	const file = liveFile(dir, id);
+	if (file) {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		writeFileSync(file, JSON.stringify(live), { mode: 0o600 });
+	}
+}
+
+function readLiveSession(dir: string, id: string): LiveSession | undefined {
+	const file = liveFile(dir, id);
+	try {
+		const live = file ? JSON.parse(readFileSync(file, "utf8")) : undefined;
+
+		return typeof live?.pid === "number" && typeof live?.tty === "string" ? live : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function unregisterLiveSession(dir: string, id: string, pid: number): void {
+	const file = liveFile(dir, id);
+	if (file && readLiveSession(dir, id)?.pid === pid) {
+		rmSync(file, { force: true });
+	}
+}
+
+/** Returns the pi process that has the session open, when that process still runs pi on the recorded terminal. */
+export async function findLiveSession(exec: Exec, dir: string, id: string): Promise<LiveSession | undefined> {
+	const live = readLiveSession(dir, id);
+	if (!live) {
+		return undefined;
+	}
+	const result = await exec("ps", ["-o", "tty=,command=", "-p", String(live.pid)], { timeout: 5000 });
+	const [tty = "", command = ""] = result.stdout.trim().split(/\s+/);
+	const isSameProcess = result.code === 0 && `/dev/${tty}` === live.tty && /^pi\b/.test(command);
+
+	return isSameProcess ? live : undefined;
+}
+
+async function prepareSession(spec: SessionSpec, cwd: string, options: ScriptOptions): Promise<PreparedSession> {
+	const resumed = spec.session?.trim()
+		? await resolveSession(spec.session, cwd, options.listSessions ?? (() => SessionManager.listAll()))
+		: undefined;
+	const sessionCwd = resumed?.cwd && statSync(resumed.cwd, { throwIfNoEntry: false })?.isDirectory() ? resumed.cwd : undefined;
+	const directory = !spec.cwd?.trim() && sessionCwd ? sessionCwd : resolveDirectory(spec.cwd, cwd);
 	if (!statSync(directory, { throwIfNoEntry: false })?.isDirectory()) {
 		throw new Error(`${directory} is not a directory.`);
 	}
 	const prompt = spec.prompt?.trim();
 	const name = spec.name?.trim() || undefined;
-	const command = buildPiCommand({ promptFile: prompt ? writePromptFile(prompt, promptDir) : undefined, model: spec.model?.trim(), name });
+	const command = buildPiCommand({
+		// A file path, never an id: pi offers to fork an id it finds in another project, but opens a session file in place.
+		session: resumed?.path,
+		promptFile: prompt ? writePromptFile(prompt, options.promptDir) : undefined,
+		model: spec.model?.trim(),
+		name,
+	});
 
-	return { directory, input: `${command}\n`, hasPrompt: Boolean(prompt), name };
+	return { directory, input: `${command}\n`, hasPrompt: Boolean(prompt), name: name ?? resumed?.name, resumed };
 }
 
 async function ownTty(exec: Exec): Promise<string> {
@@ -306,11 +433,14 @@ async function runScript(exec: Exec, script: string, args: string[], signal: Abo
 	throw new Error(`Ghostty could not open the session: ${reason}`);
 }
 
-function describeOpened(surface: Surface, stdout: string, directory: string, hasPrompt: boolean): string {
+function describeOpened(surface: Surface, stdout: string, session: PreparedSession): string {
 	const [located, tabId, terminalId] = stdout.trim().split("\t");
 	const isWindowFallback = located === "window" && surface !== "window";
 	const where = isWindowFallback ? "a new window, since no Ghostty window was open" : SURFACE_LABELS[surface];
-	const lines = [`Opened a new pi session in ${where}, in ${directory}, ${hasPrompt ? "started with the prompt" : "with no prompt"}.`];
+	const opened = session.resumed
+		? `Resumed pi session ${sessionLabel(session.resumed)} in ${where}, in ${session.directory}, ${session.hasPrompt ? "with the prompt as its next message" : "with no new message"}.`
+		: `Opened a new pi session in ${where}, in ${session.directory}, ${session.hasPrompt ? "started with the prompt" : "with no prompt"}.`;
+	const lines = [opened];
 	if (located === "front") {
 		lines.push("This session's own Ghostty terminal was not found, so the new session opened next to the focused terminal of the front window.");
 	}
@@ -325,7 +455,11 @@ function describeBatch(tabs: OpenedTab[], located: string, opensTabs: boolean): 
 	const count = tabs.reduce((total, tab) => total + tab.sessions.length, 0);
 	const lines = [`Opened ${count} pi session${count === 1 ? "" : "s"}:`];
 	for (const tab of tabs) {
-		const sessions = tab.sessions.map((session) => `${session.name ?? "unnamed"} in ${session.directory} (terminal id ${session.terminal})`);
+		const sessions = tab.sessions.map((session) => {
+			const label = session.resumed ? `${session.name ?? "unnamed"} (resumed session ${session.resumed})` : (session.name ?? "unnamed");
+
+			return `${label} in ${session.directory} (terminal id ${session.terminal})`;
+		});
 		lines.push(`- tab ${tab.title ? `"${tab.title}" ` : ""}(tab id ${tab.id}): ${sessions.join(", ")}`);
 	}
 	if (opensTabs && located === "front") {
@@ -336,13 +470,30 @@ function describeBatch(tabs: OpenedTab[], located: string, opensTabs: boolean): 
 	return lines.join("\n");
 }
 
+function describeLive(session: StoredSession, live: LiveSession, stdout: string, focused: boolean): string {
+	const [tabId, tabName] = stdout.trim().split("\t");
+	const label = sessionLabel(session);
+	if (!tabId) {
+		return `Session ${label} is already open in pi process ${live.pid} on ${live.tty}, outside the Ghostty terminals this extension can see. Tell the user to switch to it there.`;
+	}
+	const tab = `the Ghostty tab "${tabName}" (tab id ${tabId})`;
+
+	return focused
+		? `Session ${label} is already open, so no new pane opened. Its pane, in ${tab}, now has the focus: tell the user.`
+		: `Session ${label} is already open in ${tab}.`;
+}
+
 /** Throws errors whose message is shown as-is to the model or the user. */
 export async function openSession(exec: Exec, request: SessionRequest, cwd: string, options: ScriptOptions = {}): Promise<string> {
 	assertGhostty("open_session", options);
 	if (!isSurface(request.surface)) {
 		throw new Error(`Unknown surface "${request.surface}". Use one of: ${SURFACES.join(", ")}.`);
 	}
-	const session = prepareSession(request, cwd, options.promptDir);
+	const session = await prepareSession(request, cwd, options);
+	const live = session.resumed ? await findLiveSession(exec, options.liveDir ?? LIVE_DIR, session.resumed.id) : undefined;
+	if (session.resumed && live) {
+		return describeLive(session.resumed, live, await runScript(exec, GHOSTTY_FIND_SCRIPT, [live.tty, "focus"], options.signal, 15_000), true);
+	}
 	const stdout = await runScript(
 		exec,
 		GHOSTTY_SCRIPT,
@@ -351,7 +502,7 @@ export async function openSession(exec: Exec, request: SessionRequest, cwd: stri
 		15_000,
 	);
 
-	return describeOpened(request.surface, stdout, session.directory, session.hasPrompt);
+	return describeOpened(request.surface, stdout, session);
 }
 
 export async function openSessions(
@@ -368,17 +519,35 @@ export async function openSessions(
 	if (!request.tabs?.length) {
 		throw new Error("open_sessions needs at least one tab.");
 	}
-	const groups = request.tabs.map((group, index) => {
-		if (!group.sessions?.length) {
-			throw new Error(`Tab ${index + 1} has no sessions.`);
-		}
+	const groups = await Promise.all(
+		request.tabs.map(async (group, index) => {
+			if (!group.sessions?.length) {
+				throw new Error(`Tab ${index + 1} has no sessions.`);
+			}
 
-		return {
-			title: group.title?.trim() ?? "",
-			tab: group.tab?.trim() ?? "",
-			sessions: group.sessions.map((session) => prepareSession(session, cwd, options.promptDir)),
-		};
-	});
+			return {
+				title: group.title?.trim() ?? "",
+				tab: group.tab?.trim() ?? "",
+				sessions: await Promise.all(group.sessions.map((session) => prepareSession(session, cwd, options))),
+			};
+		}),
+	);
+	const resumedIds = groups.flatMap((group) => group.sessions.flatMap((session) => (session.resumed ? [session.resumed] : [])));
+	const repeated = resumedIds.find((session, index) => resumedIds.findIndex((other) => other.id === session.id) !== index);
+	if (repeated) {
+		throw new Error(`Session ${sessionLabel(repeated)} appears twice in the request: a session can run in one pane only.`);
+	}
+	const alreadyOpen: string[] = [];
+	for (const session of resumedIds) {
+		const live = await findLiveSession(exec, options.liveDir ?? LIVE_DIR, session.id);
+		if (live) {
+			const stdout = await runScript(exec, GHOSTTY_FIND_SCRIPT, [live.tty, "locate"], options.signal, 15_000);
+			alreadyOpen.push(describeLive(session, live, stdout, false));
+		}
+	}
+	if (alreadyOpen.length > 0) {
+		throw new Error(`Nothing opened. Remove these sessions from the request, they already run: ${alreadyOpen.join(" ")}`);
+	}
 
 	const args = [placement, await ownTty(exec), String(groups.length)];
 	for (const group of groups) {
@@ -396,6 +565,7 @@ export async function openSessions(
 			name: session.name,
 			directory: session.directory,
 			terminal: output.tabs[index]?.terminals[position] ?? "",
+			resumed: session.resumed?.id,
 		})),
 	}));
 
@@ -413,15 +583,45 @@ export function parseCommandArgs(args: string): SessionRequest | undefined {
 }
 
 const SESSION_FIELDS = {
-	cwd: Type.Optional(
-		Type.String({ description: "Folder to start in: absolute, relative to the working directory, or starting with ~/. Defaults to the working directory" }),
+	session: Type.Optional(
+		Type.String({
+			description:
+				"Existing session to resume instead of starting a new one: a session file path, or a full or partial session id. If it already runs, nothing opens and the result says where it runs; open_session also focuses its pane",
+		}),
 	),
-	prompt: Type.Optional(Type.String({ description: "First message the new session runs. Omit to open an idle session" })),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Folder to start in: absolute, relative to the working directory, or starting with ~/. Defaults to the folder of the resumed session, or else the working directory",
+		}),
+	),
+	prompt: Type.Optional(
+		Type.String({ description: "First message the new session runs, or the next message of a resumed one. Omit to open it idle" }),
+	),
 	model: Type.Optional(Type.String({ description: "Model for the new session, as provider/id with an optional :<thinking> suffix" })),
 	name: Type.Optional(Type.String({ description: "Display name of the new session" })),
 };
 
 export default function ghosttySessionExtension(pi: ExtensionAPI): void {
+	let registeredId: string | undefined;
+	pi.on("session_start", async (_event, ctx) => {
+		const id = ctx.sessionManager.getSessionId();
+		if (ctx.mode !== "tui" || !ctx.sessionManager.getSessionFile()) {
+			return;
+		}
+		const tty = await ownTty(pi.exec.bind(pi));
+		if (tty) {
+			registerLiveSession(LIVE_DIR, id, { pid: process.pid, tty });
+			registeredId = id;
+		}
+	});
+	pi.on("session_shutdown", () => {
+		if (registeredId) {
+			unregisterLiveSession(LIVE_DIR, registeredId, process.pid);
+			registeredId = undefined;
+		}
+	});
+
 	pi.registerTool({
 		name: "open_session",
 		label: "Open session",
@@ -431,6 +631,7 @@ export default function ghosttySessionExtension(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use open_session when the user asks for a new session or agent they can join, not for a background subagent.",
 			"Write the open_session prompt so it stands alone: the new session knows nothing about this conversation.",
+			"To reopen an existing pi session, pass its id or session file as `session`. When the result says it already runs, tell the user where.",
 		],
 		parameters: Type.Object({
 			surface: Type.Unsafe<Surface>({
