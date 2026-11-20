@@ -6,9 +6,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExecResult } from "@earendil-works/pi-coding-agent";
 import {
+	type BatchRequest,
 	buildPiCommand,
+	GHOSTTY_BATCH_SCRIPT,
+	GHOSTTY_SCRIPT,
 	isGhosttyOnMac,
 	openSession,
+	openSessions,
 	parseCommandArgs,
 	resolveDirectory,
 	type SessionRequest,
@@ -29,7 +33,7 @@ function fakeExec(osascript: Partial<ExecResult> = {}, psTty = "ttys007") {
 			return { ...base, stdout: `${psTty}\n` };
 		}
 
-		return { ...base, stdout: "own\n", ...osascript };
+		return { ...base, stdout: "own\ttab-1\tterm-1\n", ...osascript };
 	};
 
 	return { exec, calls };
@@ -99,6 +103,7 @@ test("openSession hands the surface, folder, command and own tty to the script",
 	assert.equal(statSync(match[1]!).mode & 0o777, 0o600);
 	assert.match(text, /split to the right of this session/);
 	assert.match(text, /started with the prompt/);
+	assert.match(text, /tab id is tab-1 and its terminal id is term-1/);
 });
 
 test("a prompt that starts with - or @ still reaches pi as a message", () => {
@@ -149,4 +154,66 @@ test("openSession turns osascript failures into readable errors", async () => {
 	await assert.rejects(open({ surface: "tab" }, other.exec), /could not open the session: boom/);
 	const silent = fakeExec({ code: 2 });
 	await assert.rejects(open({ surface: "tab" }, silent.exec), /osascript exited with code 2/);
+});
+
+function openBatch(request: BatchRequest, exec = fakeExec().exec) {
+	const promptDir = mkdtempSync(join(tmpdir(), "pi-ghostty-session-test-"));
+
+	return openSessions(exec, request, tmpdir(), { ...GHOSTTY, promptDir });
+}
+
+const BATCH_OUTPUT = ["located\town", "tab\ttab-1", "terminal\tt-1", "terminal\tt-2", "tab\ttab-9", "terminal\tt-3", ""].join("\n");
+
+test("openSessions flattens the tabs into argv and maps the ids back to each session", async () => {
+	const { exec, calls } = fakeExec({ stdout: BATCH_OUTPUT });
+	const { text, tabs } = await openBatch(
+		{
+			tabs: [
+				{ title: " Jira ", sessions: [{ name: "a", prompt: "review a" }, { name: "b" }] },
+				{ tab: "tab-9", sessions: [{ name: "c", cwd: "~" }] },
+			],
+		},
+		exec,
+	);
+	const args = calls.find((call) => call.command === "osascript")!.args.slice(2);
+	assert.deepEqual(args.slice(0, 6), ["tab", "/dev/ttys007", "2", "Jira", "", "2"]);
+	assert.equal(args[6], tmpdir());
+	assert.match(args[7]!, /^pi --name 'a' "\$\(command cat '[^']+'\)"\n$/);
+	assert.deepEqual(args.slice(8, 13), [tmpdir(), "pi --name 'b'\n", "", "tab-9", "1"]);
+	assert.equal(args[14], "pi --name 'c'\n");
+	assert.deepEqual(
+		tabs.map((tab) => [tab.id, tab.title, tab.sessions.map((session) => session.terminal)]),
+		[
+			["tab-1", "Jira", ["t-1", "t-2"]],
+			["tab-9", undefined, ["t-3"]],
+		],
+	);
+	assert.match(text, /^Opened 3 pi sessions:/);
+	assert.match(text, /- tab "Jira" \(tab id tab-1\): a in .* \(terminal id t-1\), b in/);
+	assert.match(text, /Pass a tab id as `tab`/);
+});
+
+test("openSessions mentions the front window fallback only when it opens new tabs", async () => {
+	const front = "located\tfront\ntab\ttab-1\nterminal\tt-1\n";
+	const newTab = await openBatch({ tabs: [{ sessions: [{}] }] }, fakeExec({ stdout: front }).exec);
+	assert.match(newTab.text, /new tabs opened in the front window/);
+	const existing = await openBatch({ tabs: [{ tab: "tab-1", sessions: [{}] }] }, fakeExec({ stdout: front }).exec);
+	assert.doesNotMatch(existing.text, /front window/);
+});
+
+test("openSessions refuses a bad request before calling Ghostty", async () => {
+	const { exec, calls } = fakeExec();
+	await assert.rejects(openBatch({ tabs: [] }, exec), /at least one tab/);
+	await assert.rejects(openBatch({ tabs: [{ sessions: [] }] }, exec), /Tab 1 has no sessions/);
+	await assert.rejects(openBatch({ placement: "split" as never, tabs: [{ sessions: [{}] }] }, exec), /Unknown placement "split"/);
+	await assert.rejects(openBatch({ tabs: [{ sessions: [{}, { cwd: "/definitely/not/here" }] }] }, exec), /is not a directory/);
+	await assert.rejects(openSessions(exec, { tabs: [{ sessions: [{}] }] }, tmpdir(), { env: {}, platform: "darwin" }), /open_sessions needs pi/);
+	assert.equal(calls.filter((call) => call.command === "osascript").length, 0);
+});
+
+test("the AppleScript sources compile", { skip: process.platform !== "darwin" }, () => {
+	for (const script of [GHOSTTY_SCRIPT, GHOSTTY_BATCH_SCRIPT]) {
+		const output = join(mkdtempSync(join(tmpdir(), "pi-ghostty-session-scpt-")), "script.scpt");
+		execFileSync("osacompile", ["-o", output, "-e", script]);
+	}
 });

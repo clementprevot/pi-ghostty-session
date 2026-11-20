@@ -1,8 +1,8 @@
 # @clementprevot/pi-ghostty-session
 
-A [Pi](https://pi.dev) extension that opens a new pi session in a Ghostty split, tab, or window on macOS. The session starts in the folder you pick, runs the prompt you give it, and stays a normal interactive session: you switch to it and carry on.
+A [Pi](https://pi.dev) extension that opens new pi sessions in Ghostty on macOS: one in a split, tab, or window, or several at once grouped in titled tabs. Each session starts in the folder you pick, runs the prompt you give it, and stays a normal interactive session: you switch to it and carry on.
 
-Use it when you want the agent to set up a session for you to join, for example a parallel task in a fresh worktree.
+Use it when you want the agent to set up sessions for you to join, for example a parallel task in a fresh worktree, or one review session per pull request.
 
 ## Install
 
@@ -36,14 +36,48 @@ The agent calls the `open_session` tool:
 
 You can open one yourself with `/open-session <surface> [prompt]`, for example `/open-session split-right review the open TODOs`.
 
-To have your agent use it, add a line like this one to your instructions: "When I ask for a new session I can join, open it with `open_session`."
+The result gives the id of the new session's tab and terminal. Pass the tab id to `open_sessions` to add sessions to that tab later.
+
+### Several sessions at once
+
+The agent calls the `open_sessions` tool with one entry per tab:
+
+```json
+{
+  "tabs": [
+    {
+      "title": "Jira",
+      "sessions": [
+        { "name": "review-web-ui-101", "cwd": "~/repos/web-ui", "prompt": "Review https://github.com/org/web-ui/pull/101." },
+        { "name": "review-api-202", "cwd": "~/repos/api", "prompt": "Review https://github.com/org/api/pull/202." }
+      ]
+    },
+    {
+      "title": "Billing",
+      "sessions": [
+        { "name": "review-api-203", "cwd": "~/repos/api", "prompt": "Review https://github.com/org/api/pull/203." }
+      ]
+    }
+  ]
+}
+```
+
+- `tabs`: each entry opens a new tab and gives every session its own pane in it.
+- `title` (optional): the tab title, usually the topic. It also renames an existing tab.
+- `tab` (optional): the id of a tab opened earlier by `open_session` or `open_sessions`. The sessions join that tab instead of a new one.
+- `sessions`: the sessions of the tab, with the same `cwd`, `prompt`, `model` and `name` fields as `open_session`.
+- `placement` (optional, top level): `tab` puts the new tabs in the window of the current session, which is the default. `window` puts them in a new window.
+
+The panes of a tab sit in two columns, filled row by row: the second pane goes right of the first, the third under the first, and so on. Ghostty then evens out their sizes. The result lists each tab id and each session's terminal id.
+
+To have your agent use them, add lines like these to your instructions: "When I ask for a new session I can join, open it with `open_session`. When I ask for several related sessions at once, open them with `open_sessions`: one tab per topic, one pane per session."
 
 ## How it works
 
-1. The tool resolves the folder and checks that it exists.
+1. The tool resolves each folder and checks that it exists, before it asks Ghostty for anything.
 2. If there is a prompt, it writes it to a private file (mode 600) in `pi-ghostty-session/` under the system temp directory.
-3. It runs one AppleScript through `osascript`. The script asks Ghostty for a new surface and types `pi [--model ...] [--name ...] "$(command cat <prompt file>)"` into it. Every value reaches the script as an argument, never as script source.
-4. For a split or a tab, the script finds the terminal of the current session by its TTY. The new surface lands next to this session even when another pane has the focus. If the script cannot find that terminal (inside tmux, for example), it uses the focused terminal of the front window and says so. With no Ghostty window open, it opens a new window.
+3. It runs one AppleScript through `osascript`, even for a batch. The script asks Ghostty for each new surface and types `pi [--model ...] [--name ...] "$(command cat <prompt file>)"` into it. Every value reaches the script as an argument, never as script source.
+4. For a split or a new tab, the script finds the terminal of the current session by its TTY. The new surface lands next to this session even when another pane has the focus. If the script cannot find that terminal (inside tmux, for example), it uses the front window and says so. With no Ghostty window open, it opens a new window.
 
 The command runs in a fresh shell, so your PATH and shell setup apply, and the shell stays open when you quit pi.
 
