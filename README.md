@@ -42,7 +42,7 @@ To have your agent use it, add a line like this one to your instructions: "When 
 
 1. The tool resolves the folder and checks that it exists.
 2. If there is a prompt, it writes it to a private file (mode 600) in `pi-ghostty-session/` under the system temp directory.
-3. It runs one AppleScript through `osascript`. The script asks Ghostty for a new surface and types `pi [--model ...] [--name ...] -- "$(cat <prompt file>)"` into it. Every value reaches the script as an argument, never as script source.
+3. It runs one AppleScript through `osascript`. The script asks Ghostty for a new surface and types `pi [--model ...] [--name ...] "$(command cat <prompt file>)"` into it. Every value reaches the script as an argument, never as script source.
 4. For a split or a tab, the script finds the terminal of the current session by its TTY. The new surface lands next to this session even when another pane has the focus. If the script cannot find that terminal (inside tmux, for example), it uses the focused terminal of the front window and says so. With no Ghostty window open, it opens a new window.
 
 The command runs in a fresh shell, so your PATH and shell setup apply, and the shell stays open when you quit pi.

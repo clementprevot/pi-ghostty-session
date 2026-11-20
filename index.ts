@@ -90,9 +90,10 @@ export function buildPiCommand(options: { promptFile?: string; model?: string; n
 	if (options.name) {
 		parts.push("--name", shellQuote(options.name));
 	}
-	// The prompt goes through a file so its quotes, newlines and length never reach the shell input line.
+	// The prompt goes through a file so its quotes, newlines and length never reach the shell input line. It follows no
+	// "--": Node 26.13.1 kills itself when "--" precedes an argument that reaches PATH_MAX once joined to the cwd.
 	if (options.promptFile) {
-		parts.push("--", `"$(cat ${shellQuote(options.promptFile)})"`);
+		parts.push(`"$(command cat ${shellQuote(options.promptFile)})"`);
 	}
 
 	return parts.join(" ");
@@ -120,7 +121,8 @@ export function isGhosttyOnMac(env: Env = process.env, platform: string = proces
 export function writePromptFile(prompt: string, dir = join(tmpdir(), "pi-ghostty-session")): string {
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	const file = join(dir, `${randomUUID()}.md`);
-	writeFileSync(file, prompt, { mode: 0o600 });
+	// Without "--", pi would read a leading "-" as an option and a leading "@" as a file to attach.
+	writeFileSync(file, /^[-@]/.test(prompt) ? `\n${prompt}` : prompt, { mode: 0o600 });
 
 	return file;
 }

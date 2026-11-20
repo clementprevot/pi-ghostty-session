@@ -13,6 +13,7 @@ import {
 	resolveDirectory,
 	type SessionRequest,
 	shellQuote,
+	writePromptFile,
 } from "../index.ts";
 
 const GHOSTTY = { env: { TERM_PROGRAM: "ghostty" }, platform: "darwin" };
@@ -54,11 +55,11 @@ test("shellQuote survives single quotes in a real shell", () => {
 	assert.equal(execFileSync("sh", ["-c", `printf %s ${shellQuote(value)}`]).toString(), value);
 });
 
-test("buildPiCommand passes model, name and the prompt file after --", () => {
+test("buildPiCommand passes model, name and the prompt file as a positional argument", () => {
 	assert.equal(buildPiCommand({}), "pi");
 	assert.equal(
 		buildPiCommand({ promptFile: "/t/p.md", model: "anthropic/x:high", name: "Fix it" }),
-		`pi --model 'anthropic/x:high' --name 'Fix it' -- "$(cat '/t/p.md')"`,
+		`pi --model 'anthropic/x:high' --name 'Fix it' "$(command cat '/t/p.md')"`,
 	);
 });
 
@@ -92,12 +93,21 @@ test("openSession hands the surface, folder, command and own tty to the script",
 	assert.equal(args.surface, "split-right");
 	assert.equal(args.directory, cwd);
 	assert.equal(args.tty, "/dev/ttys007");
-	const match = args.input?.match(/^pi --model 'm\/x' -- "\$\(cat '([^']+)'\)"\n$/);
+	const match = args.input?.match(/^pi --model 'm\/x' "\$\(command cat '([^']+)'\)"\n$/);
 	assert.ok(match, `unexpected input: ${args.input}`);
 	assert.equal(readFileSync(match[1]!, "utf8"), "do the thing");
 	assert.equal(statSync(match[1]!).mode & 0o777, 0o600);
 	assert.match(text, /split to the right of this session/);
 	assert.match(text, /started with the prompt/);
+});
+
+test("a prompt that starts with - or @ still reaches pi as a message", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-ghostty-session-test-"));
+	for (const prompt of ["- step one\n- step two", "@file.md please"]) {
+		const command = buildPiCommand({ promptFile: writePromptFile(prompt, dir) });
+		const argv = execFileSync("sh", ["-c", `pi() { printf '%s\\0' "$@"; }; ${command}`]).toString().split("\0");
+		assert.deepEqual(argv, [`\n${prompt}`, ""]);
+	}
 });
 
 test("openSession without a prompt starts an idle pi and writes no file", async () => {
